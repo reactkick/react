@@ -7,7 +7,7 @@
 
 import {Binding, NodePath} from '@babel/traverse';
 import * as t from '@babel/types';
-import {CompilerError} from '../CompilerError';
+import {CompilerError, ErrorSeverity} from '../CompilerError';
 import {Environment} from './Environment';
 import {
   BasicBlock,
@@ -106,7 +106,7 @@ export default class HIRBuilder {
   #current: WipBlock;
   #entry: BlockId;
   #scopes: Array<Scope> = [];
-  #context: Array<t.Identifier>;
+  #context: Map<t.Identifier, SourceLocation>;
   #bindings: Bindings;
   #env: Environment;
   #exceptionHandlerStack: Array<BlockId> = [];
@@ -121,7 +121,7 @@ export default class HIRBuilder {
     return this.#env.nextIdentifierId;
   }
 
-  get context(): Array<t.Identifier> {
+  get context(): Map<t.Identifier, SourceLocation> {
     return this.#context;
   }
 
@@ -137,13 +137,13 @@ export default class HIRBuilder {
     env: Environment,
     options?: {
       bindings?: Bindings | null;
-      context?: Array<t.Identifier>;
+      context?: Map<t.Identifier, SourceLocation>;
       entryBlockKind?: BlockKind;
     },
   ) {
     this.#env = env;
     this.#bindings = options?.bindings ?? new Map();
-    this.#context = options?.context ?? [];
+    this.#context = options?.context ?? new Map();
     this.#entry = makeBlockId(env.nextBlockId);
     this.#current = newBlock(this.#entry, options?.entryBlockKind ?? 'block');
   }
@@ -165,6 +165,7 @@ export default class HIRBuilder {
           handler: exceptionHandler,
           id: makeInstructionId(0),
           loc: instruction.loc,
+          effects: null,
         },
         continuationBlock,
       );
@@ -307,9 +308,18 @@ export default class HIRBuilder {
 
   resolveBinding(node: t.Identifier): Identifier {
     if (node.name === 'fbt') {
-      CompilerError.throwTodo({
-        reason: 'Support local variables named "fbt"',
-        loc: node.loc ?? null,
+      CompilerError.throwDiagnostic({
+        severity: ErrorSeverity.Todo,
+        category: 'Support local variables named `fbt`',
+        description:
+          'Local variables named `fbt` may conflict with the fbt plugin and are not yet supported',
+        details: [
+          {
+            kind: 'error',
+            message: 'Rename to avoid conflict with fbt plugin',
+            loc: node.loc ?? GeneratedSource,
+          },
+        ],
       });
     }
     const originalName = node.name;

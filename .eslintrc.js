@@ -474,7 +474,7 @@ module.exports = {
     {
       files: ['packages/react-server-dom-turbopack/**/*.js'],
       globals: {
-        __turbopack_load__: 'readonly',
+        __turbopack_load_by_url__: 'readonly',
         __turbopack_require__: 'readonly',
       },
     },
@@ -608,6 +608,7 @@ module.exports = {
     symbol: 'readonly',
     SyntheticEvent: 'readonly',
     SyntheticMouseEvent: 'readonly',
+    SyntheticPointerEvent: 'readonly',
     Thenable: 'readonly',
     TimeoutID: 'readonly',
     WheelEventHandler: 'readonly',
@@ -622,6 +623,7 @@ module.exports = {
     ScrollTimeline: 'readonly',
     EventListenerOptionsOrUseCapture: 'readonly',
     FocusOptions: 'readonly',
+    OptionalEffectTiming: 'readonly',
 
     spyOnDev: 'readonly',
     spyOnDevAndProd: 'readonly',

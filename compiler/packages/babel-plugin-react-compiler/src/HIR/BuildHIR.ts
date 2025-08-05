@@ -9,6 +9,7 @@ import {NodePath, Scope} from '@babel/traverse';
 import * as t from '@babel/types';
 import invariant from 'invariant';
 import {
+  CompilerDiagnostic,
   CompilerError,
   CompilerSuggestionOperation,
   ErrorSeverity,
@@ -47,7 +48,7 @@ import {
   makeType,
   promoteTemporary,
 } from './HIR';
-import HIRBuilder, {Bindings} from './HIRBuilder';
+import HIRBuilder, {Bindings, createTemporaryPlace} from './HIRBuilder';
 import {BuiltInArrayId} from './ObjectShape';
 
 /*
@@ -72,7 +73,7 @@ export function lower(
   env: Environment,
   // Bindings captured from the outer function, in case lower() is called recursively (for lambdas)
   bindings: Bindings | null = null,
-  capturedRefs: Array<t.Identifier> = [],
+  capturedRefs: Map<t.Identifier, SourceLocation> = new Map(),
 ): Result<HIRFunction, CompilerError> {
   const builder = new HIRBuilder(env, {
     bindings,
@@ -80,13 +81,13 @@ export function lower(
   });
   const context: HIRFunction['context'] = [];
 
-  for (const ref of capturedRefs ?? []) {
+  for (const [ref, loc] of capturedRefs ?? []) {
     context.push({
       kind: 'Identifier',
       identifier: builder.resolveBinding(ref),
       effect: Effect.Unknown,
       reactive: false,
-      loc: ref.loc ?? GeneratedSource,
+      loc,
     });
   }
 
@@ -104,12 +105,17 @@ export function lower(
     if (param.isIdentifier()) {
       const binding = builder.resolveIdentifier(param);
       if (binding.kind !== 'Identifier') {
-        builder.errors.push({
-          reason: `(BuildHIR::lower) Could not find binding for param \`${param.node.name}\``,
-          severity: ErrorSeverity.Invariant,
-          loc: param.node.loc ?? null,
-          suggestions: null,
-        });
+        builder.errors.pushDiagnostic(
+          CompilerDiagnostic.create({
+            severity: ErrorSeverity.Invariant,
+            category: 'Could not find binding',
+            description: `[BuildHIR] Could not find binding for param \`${param.node.name}\`.`,
+          }).withDetail({
+            kind: 'error',
+            loc: param.node.loc ?? null,
+            message: 'Could not find binding',
+          }),
+        );
         return;
       }
       const place: Place = {
@@ -163,12 +169,17 @@ export function lower(
         'Assignment',
       );
     } else {
-      builder.errors.push({
-        reason: `(BuildHIR::lower) Handle ${param.node.type} params`,
-        severity: ErrorSeverity.Todo,
-        loc: param.node.loc ?? null,
-        suggestions: null,
-      });
+      builder.errors.pushDiagnostic(
+        CompilerDiagnostic.create({
+          severity: ErrorSeverity.Todo,
+          category: `Handle ${param.node.type} parameters`,
+          description: `[BuildHIR] Add support for ${param.node.type} parameters.`,
+        }).withDetail({
+          kind: 'error',
+          loc: param.node.loc ?? null,
+          message: 'Unsupported parameter type',
+        }),
+      );
     }
   });
 
@@ -178,22 +189,28 @@ export function lower(
     const fallthrough = builder.reserve('block');
     const terminal: ReturnTerminal = {
       kind: 'return',
+      returnVariant: 'Implicit',
       loc: GeneratedSource,
       value: lowerExpressionToTemporary(builder, body),
       id: makeInstructionId(0),
+      effects: null,
     };
     builder.terminateWithContinuation(terminal, fallthrough);
   } else if (body.isBlockStatement()) {
     lowerStatement(builder, body);
     directives = body.get('directives').map(d => d.node.value.value);
   } else {
-    builder.errors.push({
-      severity: ErrorSeverity.InvalidJS,
-      reason: `Unexpected function body kind`,
-      description: `Expected function body to be an expression or a block statement, got \`${body.type}\``,
-      loc: body.node.loc ?? null,
-      suggestions: null,
-    });
+    builder.errors.pushDiagnostic(
+      CompilerDiagnostic.create({
+        severity: ErrorSeverity.InvalidJS,
+        category: `Unexpected function body kind`,
+        description: `Expected function body to be an expression or a block statement, got \`${body.type}\`.`,
+      }).withDetail({
+        kind: 'error',
+        loc: body.node.loc ?? null,
+        message: 'Expected a block statement or expression',
+      }),
+    );
   }
 
   if (builder.errors.hasErrors()) {
@@ -203,6 +220,7 @@ export function lower(
   builder.terminate(
     {
       kind: 'return',
+      returnVariant: 'Void',
       loc: GeneratedSource,
       value: lowerValueToTemporary(builder, {
         kind: 'Primitive',
@@ -210,6 +228,7 @@ export function lower(
         loc: GeneratedSource,
       }),
       id: makeInstructionId(0),
+      effects: null,
     },
     null,
   );
@@ -219,7 +238,7 @@ export function lower(
     params,
     fnType: bindings == null ? env.fnType : 'Other',
     returnTypeAnnotation: null, // TODO: extract the actual return type node if present
-    returnType: makeType(),
+    returns: createTemporaryPlace(env, func.node.loc ?? GeneratedSource),
     body: builder.build(),
     context,
     generator: func.node.generator === true,
@@ -227,6 +246,7 @@ export function lower(
     loc: func.node.loc ?? GeneratedSource,
     env,
     effects: null,
+    aliasingEffects: null,
     directives,
   });
 }
@@ -284,9 +304,11 @@ function lowerStatement(
       }
       const terminal: ReturnTerminal = {
         kind: 'return',
+        returnVariant: 'Explicit',
         loc: stmt.node.loc ?? GeneratedSource,
         value,
         id: makeInstructionId(0),
+        effects: null,
       };
       builder.terminate(terminal, 'block');
       return;
@@ -1237,6 +1259,7 @@ function lowerStatement(
           kind: 'Debugger',
           loc,
         },
+        effects: null,
         loc,
       });
       return;
@@ -1350,13 +1373,85 @@ function lowerStatement(
 
       return;
     }
-    case 'TypeAlias':
-    case 'TSInterfaceDeclaration':
-    case 'TSTypeAliasDeclaration': {
-      // We do not preserve type annotations/syntax through transformation
+    case 'WithStatement': {
+      builder.errors.push({
+        reason: `JavaScript 'with' syntax is not supported`,
+        description: `'with' syntax is considered deprecated and removed from JavaScript standards, consider alternatives`,
+        severity: ErrorSeverity.UnsupportedJS,
+        loc: stmtPath.node.loc ?? null,
+        suggestions: null,
+      });
+      lowerValueToTemporary(builder, {
+        kind: 'UnsupportedNode',
+        loc: stmtPath.node.loc ?? GeneratedSource,
+        node: stmtPath.node,
+      });
       return;
     }
-    case 'ClassDeclaration':
+    case 'ClassDeclaration': {
+      /**
+       * In theory we could support inline class declarations, but this is rare enough in practice
+       * and complex enough to support that we don't anticipate supporting anytime soon. Developers
+       * are encouraged to lift classes out of component/hook declarations.
+       */
+      builder.errors.push({
+        reason: 'Inline `class` declarations are not supported',
+        description: `Move class declarations outside of components/hooks`,
+        severity: ErrorSeverity.UnsupportedJS,
+        loc: stmtPath.node.loc ?? null,
+        suggestions: null,
+      });
+      lowerValueToTemporary(builder, {
+        kind: 'UnsupportedNode',
+        loc: stmtPath.node.loc ?? GeneratedSource,
+        node: stmtPath.node,
+      });
+      return;
+    }
+    case 'EnumDeclaration':
+    case 'TSEnumDeclaration': {
+      lowerValueToTemporary(builder, {
+        kind: 'UnsupportedNode',
+        loc: stmtPath.node.loc ?? GeneratedSource,
+        node: stmtPath.node,
+      });
+      return;
+    }
+    case 'ExportAllDeclaration':
+    case 'ExportDefaultDeclaration':
+    case 'ExportNamedDeclaration':
+    case 'ImportDeclaration':
+    case 'TSExportAssignment':
+    case 'TSImportEqualsDeclaration': {
+      builder.errors.push({
+        reason:
+          'JavaScript `import` and `export` statements may only appear at the top level of a module',
+        severity: ErrorSeverity.InvalidJS,
+        loc: stmtPath.node.loc ?? null,
+        suggestions: null,
+      });
+      lowerValueToTemporary(builder, {
+        kind: 'UnsupportedNode',
+        loc: stmtPath.node.loc ?? GeneratedSource,
+        node: stmtPath.node,
+      });
+      return;
+    }
+    case 'TSNamespaceExportDeclaration': {
+      builder.errors.push({
+        reason:
+          'TypeScript `namespace` statements may only appear at the top level of a module',
+        severity: ErrorSeverity.InvalidJS,
+        loc: stmtPath.node.loc ?? null,
+        suggestions: null,
+      });
+      lowerValueToTemporary(builder, {
+        kind: 'UnsupportedNode',
+        loc: stmtPath.node.loc ?? GeneratedSource,
+        node: stmtPath.node,
+      });
+      return;
+    }
     case 'DeclareClass':
     case 'DeclareExportAllDeclaration':
     case 'DeclareExportDeclaration':
@@ -1367,31 +1462,14 @@ function lowerStatement(
     case 'DeclareOpaqueType':
     case 'DeclareTypeAlias':
     case 'DeclareVariable':
-    case 'EnumDeclaration':
-    case 'ExportAllDeclaration':
-    case 'ExportDefaultDeclaration':
-    case 'ExportNamedDeclaration':
-    case 'ImportDeclaration':
     case 'InterfaceDeclaration':
     case 'OpaqueType':
     case 'TSDeclareFunction':
-    case 'TSEnumDeclaration':
-    case 'TSExportAssignment':
-    case 'TSImportEqualsDeclaration':
+    case 'TSInterfaceDeclaration':
     case 'TSModuleDeclaration':
-    case 'TSNamespaceExportDeclaration':
-    case 'WithStatement': {
-      builder.errors.push({
-        reason: `(BuildHIR::lowerStatement) Handle ${stmtPath.type} statements`,
-        severity: ErrorSeverity.Todo,
-        loc: stmtPath.node.loc ?? null,
-        suggestions: null,
-      });
-      lowerValueToTemporary(builder, {
-        kind: 'UnsupportedNode',
-        loc: stmtPath.node.loc ?? GeneratedSource,
-        node: stmtPath.node,
-      });
+    case 'TSTypeAliasDeclaration':
+    case 'TypeAlias': {
+      // We do not preserve type annotations/syntax through transformation
       return;
     }
     default: {
@@ -1894,6 +1972,7 @@ function lowerExpression(
           place: leftValue,
           loc: exprLoc,
         },
+        effects: null,
         loc: exprLoc,
       });
       builder.terminateWithContinuation(
@@ -2210,11 +2289,17 @@ function lowerExpression(
         });
         for (const [name, locations] of Object.entries(fbtLocations)) {
           if (locations.length > 1) {
-            CompilerError.throwTodo({
-              reason: `Support <${tagName}> tags with multiple <${tagName}:${name}> values`,
-              loc: locations.at(-1) ?? GeneratedSource,
-              description: null,
-              suggestions: null,
+            CompilerError.throwDiagnostic({
+              severity: ErrorSeverity.Todo,
+              category: 'Support duplicate fbt tags',
+              description: `Support \`<${tagName}>\` tags with multiple \`<${tagName}:${name}>\` values`,
+              details: locations.map(loc => {
+                return {
+                  kind: 'error',
+                  message: `Multiple \`<${tagName}:${name}>\` tags found`,
+                  loc,
+                };
+              }),
             });
           }
         }
@@ -2829,6 +2914,7 @@ function lowerOptionalCallExpression(
           args,
           loc,
         },
+        effects: null,
         loc,
       });
     } else {
@@ -2842,6 +2928,7 @@ function lowerOptionalCallExpression(
           args,
           loc,
         },
+        effects: null,
         loc,
       });
     }
@@ -2938,6 +3025,8 @@ function isReorderableExpression(
         }
       }
     }
+    case 'TSAsExpression':
+    case 'TSNonNullExpression':
     case 'TypeCastExpression': {
       return isReorderableExpression(
         builder,
@@ -3430,15 +3519,16 @@ function lowerFunction(
    * This isn't a problem in practice because use Babel's scope analysis to
    * identify the correct references.
    */
-  const lowering = lower(expr, builder.environment, builder.bindings, [
-    ...builder.context,
-    ...capturedContext,
-  ]);
+  const lowering = lower(
+    expr,
+    builder.environment,
+    builder.bindings,
+    new Map([...builder.context, ...capturedContext]),
+  );
   let loweredFunc: HIRFunction;
   if (lowering.isErr()) {
-    lowering
-      .unwrapErr()
-      .details.forEach(detail => builder.errors.pushErrorDetail(detail));
+    const functionErrors = lowering.unwrapErr();
+    builder.errors.merge(functionErrors);
     return null;
   }
   loweredFunc = lowering.unwrap();
@@ -3465,9 +3555,10 @@ export function lowerValueToTemporary(
   const place: Place = buildTemporaryPlace(builder, value.loc);
   builder.push({
     id: makeInstructionId(0),
-    value: value,
-    loc: value.loc,
     lvalue: {...place},
+    value: value,
+    effects: null,
+    loc: value.loc,
   });
   return place;
 }
@@ -3491,6 +3582,16 @@ function lowerIdentifier(
       return place;
     }
     default: {
+      if (binding.kind === 'Global' && binding.name === 'eval') {
+        builder.errors.push({
+          reason: `The 'eval' function is not supported`,
+          description:
+            'Eval is an anti-pattern in JavaScript, and the code executed cannot be evaluated by React Compiler',
+          severity: ErrorSeverity.UnsupportedJS,
+          loc: exprPath.node.loc ?? null,
+          suggestions: null,
+        });
+      }
       return lowerValueToTemporary(builder, {
         kind: 'LoadGlobal',
         binding,
@@ -4150,6 +4251,11 @@ function captureScopes({from, to}: {from: Scope; to: Scope}): Set<Scope> {
   return scopes;
 }
 
+/**
+ * Returns a mapping of "context" identifiers — references to free variables that
+ * will become part of the function expression's `context` array — along with the
+ * source location of their first reference within the function.
+ */
 function gatherCapturedContext(
   fn: NodePath<
     | t.FunctionExpression
@@ -4158,8 +4264,8 @@ function gatherCapturedContext(
     | t.ObjectMethod
   >,
   componentScope: Scope,
-): Array<t.Identifier> {
-  const capturedIds = new Set<t.Identifier>();
+): Map<t.Identifier, SourceLocation> {
+  const capturedIds = new Map<t.Identifier, SourceLocation>();
 
   /*
    * Capture all the scopes from the parent of this function up to and including
@@ -4202,8 +4308,15 @@ function gatherCapturedContext(
 
     // Add the base identifier binding as a dependency.
     const binding = baseIdentifier.scope.getBinding(baseIdentifier.node.name);
-    if (binding !== undefined && pureScopes.has(binding.scope)) {
-      capturedIds.add(binding.identifier);
+    if (
+      binding !== undefined &&
+      pureScopes.has(binding.scope) &&
+      !capturedIds.has(binding.identifier)
+    ) {
+      capturedIds.set(
+        binding.identifier,
+        path.node.loc ?? binding.identifier.loc ?? GeneratedSource,
+      );
     }
   }
 
@@ -4240,7 +4353,7 @@ function gatherCapturedContext(
     },
   });
 
-  return [...capturedIds.keys()];
+  return capturedIds;
 }
 
 function notNull<T>(value: T | null): value is T {
